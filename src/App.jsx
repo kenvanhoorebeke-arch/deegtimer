@@ -547,11 +547,19 @@ function PlanEditor({ initial, timers, onSave, onCancel }) {
 export default function App() {
   usePWAMeta();
   const [screen, setScreen]           = useState("home");
-  const [timers, setTimers]           = useState(DEFAULT_TIMERS);
-  const [plans, setPlans]             = useState(DEFAULT_PLANS);
+  const [timers, setTimers]           = useState(() => {
+    try { const s = localStorage.getItem("deegtimer_timers"); return s ? JSON.parse(s) : DEFAULT_TIMERS; } catch { return DEFAULT_TIMERS; }
+  });
+  const [plans, setPlans]             = useState(() => {
+    try { const s = localStorage.getItem("deegtimer_plans"); return s ? JSON.parse(s) : DEFAULT_PLANS; } catch { return DEFAULT_PLANS; }
+  });
   const [active, setActive]           = useState([]);
   const [editingPlan, setEditingPlan] = useState(null);
   const [editingTpl, setEditingTpl]   = useState(null);
+
+  // Sla timers en plannen op bij elke wijziging
+  useEffect(() => { try { localStorage.setItem("deegtimer_timers", JSON.stringify(timers)); } catch {} }, [timers]);
+  useEffect(() => { try { localStorage.setItem("deegtimer_plans", JSON.stringify(plans)); } catch {} }, [plans]);
 
   const tick = useCallback(() => {
     setActive(prev => prev.map(t => {
