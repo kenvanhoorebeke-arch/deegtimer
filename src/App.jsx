@@ -586,6 +586,68 @@ export default function App() {
 
   useEffect(()=>{ const iv=setInterval(tick,1000); return ()=>clearInterval(iv); },[tick]);
 
+  // Herstel de timer na schermvergrendeling door de werkelijk verstreken tijd bij te houden
+  const hiddenAtRef = useRef(null);
+  useEffect(() => {
+    function advanceTimerBySeconds(t, seconds) {
+      let rem = t.remaining;
+      let step = t.currentStep;
+      let repeat = t.currentRepeat;
+      let left = seconds;
+      while (left > 0) {
+        if (left < rem) {
+          rem -= left;
+          left = 0;
+        } else {
+          left -= rem;
+          const stepData = t.steps[step];
+          const nextRepeat = repeat + 1;
+          if (nextRepeat < stepData.repeat) {
+            repeat = nextRepeat;
+            rem = stepData.duration;
+          } else {
+            const nextStep = step + 1;
+            if (nextStep < t.steps.length) {
+              step = nextStep;
+              repeat = 0;
+              rem = t.steps[nextStep].duration;
+            } else {
+              startAlarm(t.id);
+              return {...t, remaining:0, currentStep:step, currentRepeat:repeat, alerting:"done"};
+            }
+          }
+        }
+      }
+      if (step !== t.currentStep) {
+        startAlarm(t.id);
+        return {...t, remaining:rem, currentStep:step, currentRepeat:repeat, alerting:"next", pendingStep:step};
+      }
+      if (repeat !== t.currentRepeat) {
+        startAlarm(t.id);
+        return {...t, remaining:rem, currentStep:step, currentRepeat:repeat, alerting:"repeat", pendingRepeat:repeat};
+      }
+      return {...t, remaining:rem};
+    }
+
+    function handleVisibilityChange() {
+      if (document.hidden) {
+        hiddenAtRef.current = Date.now();
+      } else if (hiddenAtRef.current != null) {
+        const elapsed = Math.round((Date.now() - hiddenAtRef.current) / 1000);
+        hiddenAtRef.current = null;
+        if (elapsed > 0) {
+          setActive(prev => prev.map(t => {
+            if (!t.started || t.paused || t.done || t.alerting) return t;
+            return advanceTimerBySeconds(t, elapsed);
+          }));
+        }
+      }
+    }
+
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+  }, []);
+
   function launchTimer(tpl) {
     setActive(a=>[...a,{
       id:`a${Date.now()}`, name:tpl.name, emoji:tpl.emoji,
