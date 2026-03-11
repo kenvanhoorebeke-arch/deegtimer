@@ -90,9 +90,13 @@ const DEFAULT_PLANS = [
   },
 ];
 
+let _audioCtx = null;
 function beep() {
   try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (!_audioCtx || _audioCtx.state === 'closed')
+      _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (_audioCtx.state === 'suspended') _audioCtx.resume();
+    const ctx = _audioCtx;
     [0, 0.3, 0.6].forEach(t => {
       const o = ctx.createOscillator(), g = ctx.createGain();
       o.connect(g); g.connect(ctx.destination);
@@ -129,6 +133,31 @@ function parseDur(str) {
 
 let _cIdx = 0;
 function nextColor() { return _cIdx++; }
+
+const API = import.meta.env.VITE_API_URL ?? '';
+let _pushSubCache = null;
+async function getPushSub() {
+  if (_pushSubCache) return _pushSubCache;
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      const { publicKey } = await fetch(`${API}/api/vapid-public-key`).then(r => r.json());
+      const key = Uint8Array.from(atob(publicKey.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
+      sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+    }
+    _pushSubCache = sub;
+    return sub;
+  } catch { return null; }
+}
+
+function makeTimer(name, emoji, steps) {
+  return {
+    id: `a${Date.now()}`, name, emoji, steps,
+    currentStep: 0, currentRepeat: 0, remaining: steps[0].duration,
+    started: false, paused: false, done: false, colorIndex: nextColor(),
+  };
+}
 
 function Btn({ onClick, bg=C.terra, color=C.white, children, style={} }) {
   return (
@@ -561,65 +590,117 @@ export default function App() {
   useEffect(() => { try { localStorage.setItem("deegtimer_timers", JSON.stringify(timers)); } catch {} }, [timers]);
   useEffect(() => { try { localStorage.setItem("deegtimer_plans", JSON.stringify(plans)); } catch {} }, [plans]);
 
+  // Registreer Service Worker en vraag toestemming voor notificaties
+  useEffect(() => {
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/deegtimer/sw.js', { scope: '/deegtimer/' }).catch(() => {});
+    }
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  }, []);
+
+  // Sleutels die bepalen of de server opnieuw gepland moet worden — remaining zit er bewust NIET in
+  const scheduleKey = active.map(t =>
+    [t.id, +t.started, +t.paused, +t.done, t.alerting||'', t.stepStartMs||0, t.currentStep, t.currentRepeat].join(':')
+  ).join('|');
+
+  // Plan alarm via server alleen bij echte start/stop/pauze-wijzigingen, niet elke tick
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  useEffect(() => {
+    if (!('serviceWorker' in navigator) || Notification.permission !== 'granted') return;
+    activeRef.current.forEach(t => {
+      const running = t.started && !t.paused && !t.done && !t.alerting && t.stepStartMs;
+      if (running) {
+        const fireAt = t.stepStartMs + t.steps[t.currentStep].duration * 1000;
+        getPushSub().then(sub => {
+          if (!sub) return;
+          fetch(`${API}/api/schedule`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ subscription: sub.toJSON(), timerId: t.id, name: t.name, emoji: t.emoji || '⏱', fireAt }),
+          }).catch(() => {});
+        });
+      } else {
+        fetch(`${API}/api/cancel`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ timerId: t.id }),
+        }).catch(() => {});
+      }
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scheduleKey]);
+
   const tick = useCallback(() => {
+    const now = Date.now();
     setActive(prev => prev.map(t => {
-      if (!t.started || t.paused || t.done || t.alerting) return t;
-      const rem = t.remaining - 1;
-      if (rem <= 0) {
+      if (!t.started || t.paused || t.done || t.alerting || !t.stepStartMs) return t;
+      const remaining = Math.max(0, t.steps[t.currentStep].duration - Math.round((now - t.stepStartMs) / 1000));
+      if (remaining <= 0) {
         const step = t.steps[t.currentStep];
         const nr = t.currentRepeat + 1;
-        if (nr < step.repeat) {
-          startAlarm(t.id);
-          return {...t, remaining:0, alerting:"repeat", pendingRepeat:nr};
-        }
+        if (nr < step.repeat) { startAlarm(t.id); return { ...t, remaining: 0, alerting: "repeat", pendingRepeat: nr, stepStartMs: null }; }
         const ns = t.currentStep + 1;
-        if (ns < t.steps.length) {
-          startAlarm(t.id);
-          return {...t, remaining:0, alerting:"next", pendingStep:ns};
-        }
-        startAlarm(t.id);
-        return {...t, remaining:0, alerting:"done"};
+        if (ns < t.steps.length) { startAlarm(t.id); return { ...t, remaining: 0, alerting: "next", pendingStep: ns, stepStartMs: null }; }
+        startAlarm(t.id); return { ...t, remaining: 0, alerting: "done", stepStartMs: null };
       }
-      return {...t, remaining:rem};
+      return { ...t, remaining };
     }));
   }, []);
 
   useEffect(()=>{ const iv=setInterval(tick,1000); return ()=>clearInterval(iv); },[tick]);
 
+  // Onmiddellijke alarm-check bij terugkeer uit slaapstand / achtergrond
+  useEffect(() => {
+    const handler = () => { if (!document.hidden) tick(); };
+    document.addEventListener("visibilitychange", handler);
+    window.addEventListener("pageshow", tick); // iOS
+    return () => {
+      document.removeEventListener("visibilitychange", handler);
+      window.removeEventListener("pageshow", tick);
+    };
+  }, [tick]);
+
   function launchTimer(tpl) {
-    setActive(a=>[...a,{
-      id:`a${Date.now()}`, name:tpl.name, emoji:tpl.emoji,
-      steps:[{id:"q1",name:tpl.name,duration:tpl.duration,repeat:1}],
-      currentStep:0, currentRepeat:0, remaining:tpl.duration,
-      started:false, paused:false, done:false, colorIndex:nextColor(),
-    }]);
+    setActive(a=>[...a, makeTimer(tpl.name, tpl.emoji, [{id:"q1",name:tpl.name,duration:tpl.duration,repeat:1}])]);
     setScreen("home");
   }
-
   function launchPlan(plan) {
-    setActive(a=>[...a,{
-      id:`a${Date.now()}`, name:plan.name, emoji:plan.emoji,
-      steps:plan.steps, currentStep:0, currentRepeat:0,
-      remaining:plan.steps[0].duration,
-      started:false, paused:false, done:false, colorIndex:nextColor(),
-    }]);
+    setActive(a=>[...a, makeTimer(plan.name, plan.emoji, plan.steps)]);
     setScreen("home");
   }
-
   function launchQuick(label, secs) {
-    setActive(a=>[...a,{
-      id:`a${Date.now()}`, name:label, emoji:"⏱",
-      steps:[{id:"q1",name:label,duration:secs,repeat:1}],
-      currentStep:0, currentRepeat:0, remaining:secs,
-      started:false, paused:false, done:false, colorIndex:nextColor(),
-    }]);
+    setActive(a=>[...a, makeTimer(label, "⏱", [{id:"q1",name:label,duration:secs,repeat:1}])]);
   }
 
-  const startTimer  = id  => setActive(a=>a.map(t=>t.id===id?{...t,started:true,paused:false}:t));
-  const togglePause = id  => setActive(a=>a.map(t=>t.id===id?{...t,paused:!t.paused}:t));
+  const startTimer  = id  => setActive(a=>a.map(t=>t.id===id?{...t,started:true,paused:false,stepStartMs:Date.now()}:t));
+  const togglePause = id  => setActive(a=>a.map(t=>{
+    if(t.id!==id) return t;
+    if(t.paused) {
+      // Hervatten: zet stepStartMs zodat remaining klopt
+      const startMs = Date.now() - (t.steps[t.currentStep].duration - t.remaining) * 1000;
+      return {...t, paused:false, stepStartMs:startMs};
+    } else {
+      // Pauzeren: sla werkelijke remaining op
+      const rem = t.stepStartMs ? Math.max(1, t.steps[t.currentStep].duration - Math.round((Date.now()-t.stepStartMs)/1000)) : t.remaining;
+      return {...t, paused:true, remaining:rem, stepStartMs:null};
+    }
+  }));
   const stopTimer   = id  => { stopAlarm(id); setActive(a=>a.filter(t=>t.id!==id)); };
-  const skipStep    = (id,idx) => setActive(a=>a.map(t=>t.id===id?{...t,currentStep:idx,currentRepeat:0,remaining:t.steps[idx].duration,alerting:null}:t));
-  const adjust      = (id,s)   => setActive(a=>a.map(t=>t.id===id?{...t,remaining:Math.max(1,t.remaining+s)}:t));
+  const skipStep    = (id,idx) => setActive(a=>a.map(t=>{
+    if(t.id!==id) return t;
+    const dur = t.steps[idx].duration;
+    return {...t, currentStep:idx, currentRepeat:0, remaining:dur, alerting:null,
+      stepStartMs:(t.started && !t.paused) ? Date.now() : null};
+  }));
+  const adjust      = (id,s)   => setActive(a=>a.map(t=>{
+    if(t.id!==id) return t;
+    const rem = Math.max(1, t.remaining+s);
+    const diff = rem - t.remaining;
+    return {...t, remaining:rem, stepStartMs:t.stepStartMs ? t.stepStartMs - diff*1000 : null};
+  }));
 
   function confirmAlert(id) {
     stopAlarm(id);
@@ -645,8 +726,8 @@ export default function App() {
     setEditingPlan(null); setScreen("plans");
   };
 
-  const running = active.filter(t=>!t.done || t.alerting==="done");
-  const done    = active.filter(t=>t.done);
+  const running = active.filter(t => !t.done);
+  const done    = active.filter(t => t.done);
 
   const NAV = [
     { id:"home",   label:"Home",       icon:"🏠" },
