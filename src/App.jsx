@@ -585,15 +585,20 @@ export default function App() {
     }).catch(() => {});
   }, [active]);
 
-  const lastTickRef = useRef(Date.now());
   const tick = useCallback(() => {
     const now = Date.now();
-    const delta = Math.round((now - lastTickRef.current) / 1000);
-    lastTickRef.current = now;
-    if (delta <= 0) return;
     setActive(prev => prev.map(t => {
-      if (!t.started || t.paused || t.done || t.alerting) return t;
-      return advanceTimerBySeconds(t, delta, startAlarm);
+      if (!t.started || t.paused || t.done || t.alerting || !t.stepStartMs) return t;
+      const remaining = Math.max(0, t.steps[t.currentStep].duration - Math.round((now - t.stepStartMs) / 1000));
+      if (remaining <= 0) {
+        const step = t.steps[t.currentStep];
+        const nr = t.currentRepeat + 1;
+        if (nr < step.repeat) { startAlarm(t.id); return { ...t, remaining: 0, alerting: "repeat", pendingRepeat: nr, stepStartMs: null }; }
+        const ns = t.currentStep + 1;
+        if (ns < t.steps.length) { startAlarm(t.id); return { ...t, remaining: 0, alerting: "next", pendingStep: ns, stepStartMs: null }; }
+        startAlarm(t.id); return { ...t, remaining: 0, alerting: "done", stepStartMs: null };
+      }
+      return { ...t, remaining };
     }));
   }, []);
 
@@ -628,11 +633,32 @@ export default function App() {
     }]);
   }
 
-  const startTimer  = id  => setActive(a=>a.map(t=>t.id===id?{...t,started:true,paused:false}:t));
-  const togglePause = id  => setActive(a=>a.map(t=>t.id===id?{...t,paused:!t.paused}:t));
+  const startTimer  = id  => setActive(a=>a.map(t=>t.id===id?{...t,started:true,paused:false,stepStartMs:Date.now()}:t));
+  const togglePause = id  => setActive(a=>a.map(t=>{
+    if(t.id!==id) return t;
+    if(t.paused) {
+      // Hervatten: zet stepStartMs zodat remaining klopt
+      const startMs = Date.now() - (t.steps[t.currentStep].duration - t.remaining) * 1000;
+      return {...t, paused:false, stepStartMs:startMs};
+    } else {
+      // Pauzeren: sla werkelijke remaining op
+      const rem = t.stepStartMs ? Math.max(1, t.steps[t.currentStep].duration - Math.round((Date.now()-t.stepStartMs)/1000)) : t.remaining;
+      return {...t, paused:true, remaining:rem, stepStartMs:null};
+    }
+  }));
   const stopTimer   = id  => { stopAlarm(id); setActive(a=>a.filter(t=>t.id!==id)); };
-  const skipStep    = (id,idx) => setActive(a=>a.map(t=>t.id===id?{...t,currentStep:idx,currentRepeat:0,remaining:t.steps[idx].duration,alerting:null}:t));
-  const adjust      = (id,s)   => setActive(a=>a.map(t=>t.id===id?{...t,remaining:Math.max(1,t.remaining+s)}:t));
+  const skipStep    = (id,idx) => setActive(a=>a.map(t=>{
+    if(t.id!==id) return t;
+    const dur = t.steps[idx].duration;
+    return {...t, currentStep:idx, currentRepeat:0, remaining:dur, alerting:null,
+      stepStartMs:(t.started && !t.paused) ? Date.now() : null};
+  }));
+  const adjust      = (id,s)   => setActive(a=>a.map(t=>{
+    if(t.id!==id) return t;
+    const rem = Math.max(1, t.remaining+s);
+    const diff = rem - t.remaining;
+    return {...t, remaining:rem, stepStartMs:t.stepStartMs ? t.stepStartMs - diff*1000 : null};
+  }));
 
   function confirmAlert(id) {
     stopAlarm(id);
