@@ -1,5 +1,4 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { advanceTimerBySeconds } from "./timerLogic.js";
 
 const C = {
   terra: "#C1603A", terraL: "#D4785A", terraD: "#A04A28",
@@ -91,9 +90,13 @@ const DEFAULT_PLANS = [
   },
 ];
 
+let _audioCtx = null;
 function beep() {
   try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (!_audioCtx || _audioCtx.state === 'closed')
+      _audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (_audioCtx.state === 'suspended') _audioCtx.resume();
+    const ctx = _audioCtx;
     [0, 0.3, 0.6].forEach(t => {
       const o = ctx.createOscillator(), g = ctx.createGain();
       o.connect(g); g.connect(ctx.destination);
@@ -130,6 +133,31 @@ function parseDur(str) {
 
 let _cIdx = 0;
 function nextColor() { return _cIdx++; }
+
+const API = import.meta.env.VITE_API_URL ?? '';
+let _pushSubCache = null;
+async function getPushSub() {
+  if (_pushSubCache) return _pushSubCache;
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      const { publicKey } = await fetch(`${API}/api/vapid-public-key`).then(r => r.json());
+      const key = Uint8Array.from(atob(publicKey.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
+      sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+    }
+    _pushSubCache = sub;
+    return sub;
+  } catch { return null; }
+}
+
+function makeTimer(name, emoji, steps) {
+  return {
+    id: `a${Date.now()}`, name, emoji, steps,
+    currentStep: 0, currentRepeat: 0, remaining: steps[0].duration,
+    started: false, paused: false, done: false, colorIndex: nextColor(),
+  };
+}
 
 function Btn({ onClick, bg=C.terra, color=C.white, children, style={} }) {
   return (
@@ -572,28 +600,17 @@ export default function App() {
     }
   }, []);
 
-  // Push-subscription ophalen (cached in ref)
-  const pushSubRef = useRef(null);
-  const API = import.meta.env.VITE_API_URL ?? '';
-  async function getPushSub() {
-    if (pushSubRef.current) return pushSubRef.current;
-    try {
-      const reg = await navigator.serviceWorker.ready;
-      let sub = await reg.pushManager.getSubscription();
-      if (!sub) {
-        const { publicKey } = await fetch(`${API}/api/vapid-public-key`).then(r => r.json());
-        const key = Uint8Array.from(atob(publicKey.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
-        sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
-      }
-      pushSubRef.current = sub;
-      return sub;
-    } catch { return null; }
-  }
+  // Sleutels die bepalen of de server opnieuw gepland moet worden — remaining zit er bewust NIET in
+  const scheduleKey = active.map(t =>
+    [t.id, +t.started, +t.paused, +t.done, t.alerting||'', t.stepStartMs||0, t.currentStep, t.currentRepeat].join(':')
+  ).join('|');
 
-  // Plan alarm via server (betrouwbaar ook tijdens slaapstand) + cancel bij stop/pauze
+  // Plan alarm via server alleen bij echte start/stop/pauze-wijzigingen, niet elke tick
+  const activeRef = useRef(active);
+  activeRef.current = active;
   useEffect(() => {
     if (!('serviceWorker' in navigator) || Notification.permission !== 'granted') return;
-    active.forEach(t => {
+    activeRef.current.forEach(t => {
       const running = t.started && !t.paused && !t.done && !t.alerting && t.stepStartMs;
       if (running) {
         const fireAt = t.stepStartMs + t.steps[t.currentStep].duration * 1000;
@@ -613,7 +630,8 @@ export default function App() {
         }).catch(() => {});
       }
     });
-  }, [active]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scheduleKey]);
 
   const tick = useCallback(() => {
     const now = Date.now();
@@ -646,32 +664,15 @@ export default function App() {
   }, [tick]);
 
   function launchTimer(tpl) {
-    setActive(a=>[...a,{
-      id:`a${Date.now()}`, name:tpl.name, emoji:tpl.emoji,
-      steps:[{id:"q1",name:tpl.name,duration:tpl.duration,repeat:1}],
-      currentStep:0, currentRepeat:0, remaining:tpl.duration,
-      started:false, paused:false, done:false, colorIndex:nextColor(),
-    }]);
+    setActive(a=>[...a, makeTimer(tpl.name, tpl.emoji, [{id:"q1",name:tpl.name,duration:tpl.duration,repeat:1}])]);
     setScreen("home");
   }
-
   function launchPlan(plan) {
-    setActive(a=>[...a,{
-      id:`a${Date.now()}`, name:plan.name, emoji:plan.emoji,
-      steps:plan.steps, currentStep:0, currentRepeat:0,
-      remaining:plan.steps[0].duration,
-      started:false, paused:false, done:false, colorIndex:nextColor(),
-    }]);
+    setActive(a=>[...a, makeTimer(plan.name, plan.emoji, plan.steps)]);
     setScreen("home");
   }
-
   function launchQuick(label, secs) {
-    setActive(a=>[...a,{
-      id:`a${Date.now()}`, name:label, emoji:"⏱",
-      steps:[{id:"q1",name:label,duration:secs,repeat:1}],
-      currentStep:0, currentRepeat:0, remaining:secs,
-      started:false, paused:false, done:false, colorIndex:nextColor(),
-    }]);
+    setActive(a=>[...a, makeTimer(label, "⏱", [{id:"q1",name:label,duration:secs,repeat:1}])]);
   }
 
   const startTimer  = id  => setActive(a=>a.map(t=>t.id===id?{...t,started:true,paused:false,stepStartMs:Date.now()}:t));
@@ -725,8 +726,8 @@ export default function App() {
     setEditingPlan(null); setScreen("plans");
   };
 
-  const running = active.filter(t=>!t.done || t.alerting==="done");
-  const done    = active.filter(t=>t.done);
+  const running = active.filter(t => !t.done);
+  const done    = active.filter(t => t.done);
 
   const NAV = [
     { id:"home",   label:"Home",       icon:"🏠" },
