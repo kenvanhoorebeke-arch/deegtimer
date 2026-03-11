@@ -585,52 +585,19 @@ export default function App() {
     }).catch(() => {});
   }, [active]);
 
+  const lastTickRef = useRef(Date.now());
   const tick = useCallback(() => {
+    const now = Date.now();
+    const delta = Math.round((now - lastTickRef.current) / 1000);
+    lastTickRef.current = now;
+    if (delta <= 0) return;
     setActive(prev => prev.map(t => {
       if (!t.started || t.paused || t.done || t.alerting) return t;
-      const rem = t.remaining - 1;
-      if (rem <= 0) {
-        const step = t.steps[t.currentStep];
-        const nr = t.currentRepeat + 1;
-        if (nr < step.repeat) {
-          startAlarm(t.id);
-          return {...t, remaining:0, alerting:"repeat", pendingRepeat:nr};
-        }
-        const ns = t.currentStep + 1;
-        if (ns < t.steps.length) {
-          startAlarm(t.id);
-          return {...t, remaining:0, alerting:"next", pendingStep:ns};
-        }
-        startAlarm(t.id);
-        return {...t, remaining:0, alerting:"done"};
-      }
-      return {...t, remaining:rem};
+      return advanceTimerBySeconds(t, delta, startAlarm);
     }));
   }, []);
 
   useEffect(()=>{ const iv=setInterval(tick,1000); return ()=>clearInterval(iv); },[tick]);
-
-  // Herstel de timer na schermvergrendeling door de werkelijk verstreken tijd bij te houden
-  const hiddenAtRef = useRef(null);
-  useEffect(() => {
-    function handleVisibilityChange() {
-      if (document.hidden) {
-        hiddenAtRef.current = Date.now();
-      } else if (hiddenAtRef.current != null) {
-        const elapsed = Math.round((Date.now() - hiddenAtRef.current) / 1000);
-        hiddenAtRef.current = null;
-        if (elapsed > 0) {
-          setActive(prev => prev.map(t => {
-            if (!t.started || t.paused || t.done || t.alerting) return t;
-            return advanceTimerBySeconds(t, elapsed, startAlarm);
-          }));
-        }
-      }
-    }
-
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
-  }, []);
 
   function launchTimer(tpl) {
     setActive(a=>[...a,{
