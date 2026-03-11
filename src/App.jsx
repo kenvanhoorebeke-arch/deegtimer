@@ -604,6 +604,17 @@ export default function App() {
 
   useEffect(()=>{ const iv=setInterval(tick,1000); return ()=>clearInterval(iv); },[tick]);
 
+  // Onmiddellijke alarm-check bij terugkeer uit slaapstand / achtergrond
+  useEffect(() => {
+    const handler = () => { if (!document.hidden) tick(); };
+    document.addEventListener("visibilitychange", handler);
+    window.addEventListener("pageshow", tick); // iOS
+    return () => {
+      document.removeEventListener("visibilitychange", handler);
+      window.removeEventListener("pageshow", tick);
+    };
+  }, [tick]);
+
   function launchTimer(tpl) {
     setActive(a=>[...a,{
       id:`a${Date.now()}`, name:tpl.name, emoji:tpl.emoji,
