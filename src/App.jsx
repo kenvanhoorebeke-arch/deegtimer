@@ -574,13 +574,14 @@ export default function App() {
 
   // Push-subscription ophalen (cached in ref)
   const pushSubRef = useRef(null);
+  const API = import.meta.env.VITE_API_URL ?? '';
   async function getPushSub() {
     if (pushSubRef.current) return pushSubRef.current;
     try {
       const reg = await navigator.serviceWorker.ready;
       let sub = await reg.pushManager.getSubscription();
       if (!sub) {
-        const { publicKey } = await fetch('/api/vapid-public-key').then(r => r.json());
+        const { publicKey } = await fetch(`${API}/api/vapid-public-key`).then(r => r.json());
         const key = Uint8Array.from(atob(publicKey.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
         sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
       }
@@ -598,14 +599,14 @@ export default function App() {
         const fireAt = t.stepStartMs + t.steps[t.currentStep].duration * 1000;
         getPushSub().then(sub => {
           if (!sub) return;
-          fetch('/api/schedule', {
+          fetch(`${API}/api/schedule`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ subscription: sub.toJSON(), timerId: t.id, name: t.name, emoji: t.emoji || '⏱', fireAt }),
           }).catch(() => {});
         });
       } else {
-        fetch('/api/cancel', {
+        fetch(`${API}/api/cancel`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ timerId: t.id }),
