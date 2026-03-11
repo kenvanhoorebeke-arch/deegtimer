@@ -561,6 +561,29 @@ export default function App() {
   useEffect(() => { try { localStorage.setItem("deegtimer_timers", JSON.stringify(timers)); } catch {} }, [timers]);
   useEffect(() => { try { localStorage.setItem("deegtimer_plans", JSON.stringify(plans)); } catch {} }, [plans]);
 
+  // Registreer Service Worker en vraag toestemming voor notificaties
+  useEffect(() => {
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/deegtimer/sw.js', { scope: '/deegtimer/' }).catch(() => {});
+    }
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  }, []);
+
+  // Stuur alarm-planning naar de Service Worker bij elke statuswijziging
+  useEffect(() => {
+    if (!('serviceWorker' in navigator) || Notification.permission !== 'granted') return;
+    navigator.serviceWorker.ready.then(reg => {
+      active.forEach(t => {
+        const msg = (!t.started || t.paused || t.done || t.alerting)
+          ? { type: 'CANCEL', id: t.id }
+          : { type: 'SCHEDULE', id: t.id, name: t.name, emoji: t.emoji || '⏱', remaining: t.remaining };
+        reg.active?.postMessage(msg);
+      });
+    }).catch(() => {});
+  }, [active]);
+
   const tick = useCallback(() => {
     setActive(prev => prev.map(t => {
       if (!t.started || t.paused || t.done || t.alerting) return t;
