@@ -572,17 +572,46 @@ export default function App() {
     }
   }, []);
 
-  // Stuur alarm-planning naar de Service Worker bij elke statuswijziging
+  // Push-subscription ophalen (cached in ref)
+  const pushSubRef = useRef(null);
+  async function getPushSub() {
+    if (pushSubRef.current) return pushSubRef.current;
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        const { publicKey } = await fetch('/api/vapid-public-key').then(r => r.json());
+        const key = Uint8Array.from(atob(publicKey.replace(/-/g,'+').replace(/_/g,'/')), c => c.charCodeAt(0));
+        sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+      }
+      pushSubRef.current = sub;
+      return sub;
+    } catch { return null; }
+  }
+
+  // Plan alarm via server (betrouwbaar ook tijdens slaapstand) + cancel bij stop/pauze
   useEffect(() => {
     if (!('serviceWorker' in navigator) || Notification.permission !== 'granted') return;
-    navigator.serviceWorker.ready.then(reg => {
-      active.forEach(t => {
-        const msg = (!t.started || t.paused || t.done || t.alerting)
-          ? { type: 'CANCEL', id: t.id }
-          : { type: 'SCHEDULE', id: t.id, name: t.name, emoji: t.emoji || '⏱', remaining: t.remaining };
-        reg.active?.postMessage(msg);
-      });
-    }).catch(() => {});
+    active.forEach(t => {
+      const running = t.started && !t.paused && !t.done && !t.alerting && t.stepStartMs;
+      if (running) {
+        const fireAt = t.stepStartMs + t.steps[t.currentStep].duration * 1000;
+        getPushSub().then(sub => {
+          if (!sub) return;
+          fetch('/api/schedule', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ subscription: sub.toJSON(), timerId: t.id, name: t.name, emoji: t.emoji || '⏱', fireAt }),
+          }).catch(() => {});
+        });
+      } else {
+        fetch('/api/cancel', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ timerId: t.id }),
+        }).catch(() => {});
+      }
+    });
   }, [active]);
 
   const tick = useCallback(() => {
